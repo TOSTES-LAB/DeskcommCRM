@@ -72,7 +72,7 @@ DeskcommCRM é um sistema operacional de vendas open source com agentes de IA na
 - **API key NUNCA em query string** (vaza em logs Vercel/CF). Sempre header
 - Plaintext de bearer token mostrado **uma vez** na criação; depois apenas hash SHA256 no DB
 - Rate limit headers: `X-RateLimit-*` + `Retry-After` em 429
-- `X-Request-Id` em toda response (correlaciona com audit log)
+- Toda resposta de `ok()`/`fail()` leva o `X-Request-Id`, e é o mesmo do registro e da auditoria; as rotas que montam resposta à mão estão sendo migradas (issue #4107)
 
 ### Auth & RBAC
 - Sempre `getUser()` (valida JWT no backend). NUNCA `getSession()` (confia no cookie local)
@@ -249,10 +249,23 @@ docker compose -f docker-compose.prod.yml -f docker-compose.traefik.yml --env-fi
 Omitir `-f docker-compose.traefik.yml` recria o contêiner sem as labels de
 roteamento; o Traefik da hospedagem deixa de enxergá-lo e **o domínio inteiro
 responde `404 page not found`** — com o contêiner `healthy`, porque o
-healthcheck é um probe TCP interno e não sabe nada de roteamento.
+healthcheck é um probe TCP interno e não sabe nada de roteamento. Atrás do
+Coolify a cara é outra: `503` com `no available server` no `https` (medido,
+ver `docs/runbooks/deploy.md`).
 
-Depois de qualquer deploy, confirme que o domínio responde **307** (redireciona
-pro login) e não 404. Verificações e o caso de build local em
+**Numa VPS atrás de NAT (ou CGNAT, ou rede sem entrada), `REVERSE_PROXY=cloudflared`
+entra o `docker-compose.cloudflared.yml`:** desliga o Caddy e sobe o `cloudflared`, que
+publica por `app:3000` num túnel *remotely-managed* (só `CLOUDFLARE_TUNNEL_TOKEN` no
+`.env`; hostnames e TLS no painel da Cloudflare). Nenhuma porta é publicada. O webhook
+global do WAHA perde o 403 do Caddy; quem recusa o que chega pela borda é o próprio app
+(`chegouPelaBorda`, `lib/http/ip-do-cliente.ts`). A assinatura do remetente é opcional e
+desligada de fábrica (`/admin/sistema`). Não é suportado no single-server — o
+instalador recusa. Ver `docs/runbooks/deploy.md` §5.
+
+Depois de qualquer deploy, confirme que `/` responde **200** (a página inicial
+pública) e `/app` responde **307** (redireciona pro login), e não 404. O 200
+sozinho não prova que é o app: qualquer coisa no domínio responderia 200; o 307
+de `/app` é o sinal específico. Verificações e o caso de build local em
 `docs/runbooks/deploy.md`.
 
 O caminho normal **não constrói nada na VPS**: commit → push → PR → merge na
@@ -682,7 +695,9 @@ naquele clone — no Claude Code a skill GLOBAL vence a do projeto com o mesmo n
 
 - `deskcomm-instalar` — instalar, atualizar ou consertar a instalação numa VPS
 - `deskcomm-operacao` — usar o CRM no dia a dia, encontrar telas, fluxos e configurações pela interface
+- `deskcomm-curso` — atualizar aulas, traduções e capturas do curso a partir das mudanças do produto
 - `deskcomm-cliente-novo` — configurar o CRM para um cliente ou nicho (agentes, roteadores, follow-ups, conhecimento)
+- `deskcomm-saas` — revender o CRM como SaaS: planos, cobrança pela Stripe ou pelo Asaas, régua, contrato
 - `deskcomm-metricas` — desempenho, conversão, custo de IA, funil, relatório
 - `deskcomm-prompt` — afinar o prompt de um agente que não performa
 - `deskcomm-contribuir` — o espelho da triagem, antes do PR; fica quieto para o mantenedor
