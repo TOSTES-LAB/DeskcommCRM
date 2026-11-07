@@ -26,6 +26,23 @@
  * simplesmente não marca `reminder_sent_at`, e a próxima tenta de novo — o
  * adiamento é o silêncio, não uma fila nova.
  *
+ * **FORA DA JANELA DE 24 H DO CLIENTE NÃO VIRA "ENVIADO" (issue #2595).** O
+ * cron escolhia o primeiro canal WORKING e carimbava antes de enviar — e num
+ * canal com hetero-restrição (o canal social do parceiro: `freeformOutsideWindow:
+ * false` em `lib/channels/capabilities.ts`, e o comentário do arquivo mede que
+ * a API aceita com 200 e a Meta recusa a ENTREGA com 131047) o lembrete de quem
+ * reservou dias antes cairia fora da janela de 24 h da última mensagem do
+ * contato, seria carimbado como enviado e ninguém veria a recusa. A régua é a
+ * mesma de todo o resto do sistema — `estadoDaJanela` sobre
+ * `conversations.last_inbound_at`, o insumo que `before-send` e `followup-turn`
+ * já usam. O canal que não pode texto livre com a janela fechada NÃO é
+ * escolhido e o degrau NÃO carimba. Um remetente explícito ou vinculado não
+ * libera outro número; no automático só um elegível permite envio. Sem
+ * remetente seguro, o pulo sai registrado (Central de avisos, log do cron +
+ * `motivos` da resposta) e a próxima rodada tenta de novo — quando o cliente
+ * escrever, a janela abre e o lembrete sai. Para o canal que PODE, ou para o
+ * contato dentro da janela, nada muda.
+ *
  * **O carimbo é da TENTATIVA, não da entrega.** `sendMessageHandler` marca
  * `failed`/`queued` na própria mensagem e devolve normalmente; o estado da
  * entrega vive lá. Se este carimbo esperasse a entrega, um contato com número
@@ -128,9 +145,22 @@ import { IDIOMA_PADRAO, normalizarIdioma, type Idioma } from "@/lib/i18n/idiomas
 import { nomeDoContato } from "@/lib/contacts/rotulo-do-contato";
 import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { resolverRemetenteDoLembrete, type CanalDoLembrete } from "@/lib/agenda/remetente-do-lembrete";
+import {
+  lerModeloDoLembrete,
+  valoresDoModeloDoLembrete,
+  type ModeloDoLembrete,
+} from "@/lib/agenda/lembrete-por-modelo";
+import { atualizarAvisoDeRemetente } from "@/lib/agenda/aviso-de-remetente";
 import { moldeDoDegrau } from "@/lib/agenda/lembretes";
 import { autorizaCron } from "@/lib/auth/cron-auth";
-import { OrgNaoOperanteError, STATUS_OPERANTE, ehOperante, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
+import { recursoOcioso } from "@/lib/cron/piso-ocioso";
+import {
+  OrgNaoOperanteError,
+  STATUS_OPERANTE,
+  ehOperante,
+  statusDaOrgEmbutida,
+} from "@/lib/organizacao/operante";
 
 export const dynamic = "force-dynamic";
 
@@ -141,6 +171,9 @@ const LIMITE_DA_VARREDURA = 200;
 const MAIOR_ANTECEDENCIA_MS = 43_200 * 60_000;
 
 interface TipoDoCompromisso {
+  reminder_channel_session_id?: string | null;
+  /** Modelo aprovado para quando a janela de 24 h do cliente fechou (`lib/agenda/lembrete-por-modelo.ts`). */
+  reminder_meta_template_id?: string | null;
   name: string;
   reminder_enabled: boolean;
   reminder_minutes_before: number;
@@ -152,6 +185,7 @@ interface TipoDoCompromisso {
 }
 
 interface CompromissoAVencer {
+  conversation_id?: string | null;
   id: string;
   organization_id: string;
   contact_id: string;
@@ -200,14 +234,62 @@ function tipoDe(linha: CompromissoAVencer): TipoDoCompromisso | null {
  * `reminder_template_name` aponta para um modelo da organização; senão, esta
  * frase.
  */
-export function aplicarMoldeDoLembrete(
-  molde: string,
-  pecas: Record<string, string>,
-): string {
+export function aplicarMoldeDoLembrete(molde: string, pecas: Record<string, string>): string {
   return molde.replace(/\{\{\s*([a-zA-Z_]+)\s*\}\}/g, (literal, raw: string) => {
     const v = pecas[raw.toLowerCase()];
     return v === undefined ? literal : v;
   });
+}
+
+/**
+ * As peças do lembrete — as mesmas para o texto livre e para o modelo aprovado
+ * (`lib/agenda/lembrete-por-modelo.ts`), para as duas saídas dizerem o mesmo dia
+ * e a mesma hora.
+ */
+export function pecasDoLembrete(input: {
+  nomeDoContato: string | null;
+  titulo: string;
+  quando: Date;
+  timezone: string;
+  local: string | null;
+  idioma?: Idioma;
+  tipoNome?: string | null;
+}): Record<string, string> {
+  const idioma = input.idioma ?? IDIOMA_PADRAO;
+  const t = (texto: string) => traduzir(texto, idioma);
+  const etiqueta = tagDeIdioma(idioma);
+
+  const dia = new Intl.DateTimeFormat(etiqueta, {
+    timeZone: input.timezone,
+    weekday: "long",
+    day: "2-digit",
+    month: "2-digit",
+  }).format(input.quando);
+  const hora = new Intl.DateTimeFormat(etiqueta, {
+    timeZone: input.timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(input.quando);
+
+  const nome = input.nomeDoContato?.trim() ?? "";
+  return {
+    nome,
+    primeiro_nome: nome.split(/\s+/)[0] ?? "",
+    titulo: input.titulo,
+    tipo: (input.tipoNome ?? input.titulo).trim() || input.titulo,
+    dia,
+    hora,
+    endereco: input.local?.trim() ?? "",
+    quando: `${dia} ${t("às")} ${hora}`,
+  };
+}
+
+/** As peças para o modelo aprovado: o `{{1}}` nunca sai vazio (a plataforma recusa parâmetro vazio). */
+function pecasParaOModelo(input: Parameters<typeof pecasDoLembrete>[0]): Record<string, string> {
+  const pecas = pecasDoLembrete(input);
+  if (!pecas.primeiro_nome) pecas.primeiro_nome = traduzir("cliente", input.idioma ?? IDIOMA_PADRAO);
+  return pecas;
 }
 
 export function montarLembrete(input: {
@@ -237,32 +319,8 @@ export function montarLembrete(input: {
 }): string {
   const idioma = input.idioma ?? IDIOMA_PADRAO;
   const t = (texto: string) => traduzir(texto, idioma);
-  const etiqueta = tagDeIdioma(idioma);
-
-  const dia = new Intl.DateTimeFormat(etiqueta, {
-    timeZone: input.timezone,
-    weekday: "long",
-    day: "2-digit",
-    month: "2-digit",
-  }).format(input.quando);
-  const hora = new Intl.DateTimeFormat(etiqueta, {
-    timeZone: input.timezone,
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).format(input.quando);
-
-  const nome = input.nomeDoContato?.trim() ?? "";
-  const pecas: Record<string, string> = {
-    nome,
-    primeiro_nome: nome.split(/\s+/)[0] ?? "",
-    titulo: input.titulo,
-    tipo: (input.tipoNome ?? input.titulo).trim() || input.titulo,
-    dia,
-    hora,
-    endereco: input.local?.trim() ?? "",
-    quando: `${dia} ${t("às")} ${hora}`,
-  };
+  const pecas = pecasDoLembrete(input);
+  const { nome = "", dia = "", hora = "" } = pecas;
 
   const molde = input.molde?.trim();
   if (molde) return aplicarMoldeDoLembrete(molde, pecas);
@@ -491,6 +549,36 @@ export function degrausPendentes(input: {
     .sort((a, b) => b - a);
 }
 
+/**
+ * O QUE RODA DEPOIS DO PORTÃO DO PISO OCIOSO (#3773), na ordem do arquivo.
+ *
+ * O portão abaixo é saída antecipada da ROTA INTEIRA: em instalação ociosa a
+ * rota sai antes de tudo isto. `tests/unit/cron-passa-pelo-portao.test.ts` lê o
+ * AST deste arquivo e reprova quando o que está de fato abaixo do portão diverge
+ * desta lista — passo novo que não roda na instalação parada não pode nascer
+ * sem alguém ver.
+ */
+const PASSOS_DEPOIS_DO_PORTAO = [
+  "const admin",
+  "const agora",
+  "const {error}",
+  "if (erroLimpeza)",
+  "const {data, error}",
+  "if (error)",
+  "const linhas",
+  "let enviados",
+  "let enviadosPorModelo",
+  "let pulados",
+  "const motivos",
+  "const pular",
+  "const organizacoes",
+  "const organizacaoDe",
+  "for (linha of linhas)",
+  "if (enviados > 0)",
+  "return",
+] as const;
+void PASSOS_DEPOIS_DO_PORTAO;
+
 async function handle(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
@@ -498,8 +586,20 @@ async function handle(req: NextRequest): Promise<Response> {
     return fail("forbidden", "Cron secret missing or invalid.", 403, { requestId });
   }
 
+  // O PISO OCIOSO (#3731): Sem compromisso futuro não há lembrete de agenda a decidir.
+  // A saída vem antes de qualquer consulta da rodada, e o portão responde de um
+  // retrato em memória (`lib/cron/piso-ocioso.ts`): esta rota ia ao PostgREST a
+  // cada batida só para descobrir que a fila está vazia.
+  if (await recursoOcioso("lembrete_de_agenda")) return ok({ pulado: "recurso_ocioso" }, { requestId });
+
   const admin = createAdminClient();
   const agora = new Date();
+  const { error: erroLimpeza } = await admin.rpc("fn_resolver_avisos_de_lembrete_expirados");
+  if (erroLimpeza)
+    logger.error("[agenda-reminder] falha ao resolver avisos vencidos", {
+      error: erroLimpeza.message,
+      requestId,
+    });
 
   // `!inner` no tipo: só interessa compromisso cujo TIPO pede lembrete. O corte
   // por `starts_at` usa a maior antecedência possível — o corte fino, que depende
@@ -507,8 +607,8 @@ async function handle(req: NextRequest): Promise<Response> {
   const { data, error } = await admin
     .from("calendar_appointments")
     .select(
-      "id, organization_id, contact_id, title, starts_at, created_at, starts_at_marked_at, location_details, reminder_sent_offsets_minutes, reminder_sent_at, " +
-        "calendar_event_types!inner(name, reminder_enabled, reminder_minutes_before, reminder_extra_offsets_minutes, reminder_template_name, reminder_body, reminder_bodies, location_details), organizations:organization_id!inner(status)",
+      "id, organization_id, contact_id, conversation_id, title, starts_at, created_at, starts_at_marked_at, location_details, reminder_sent_offsets_minutes, reminder_sent_at, " +
+        "calendar_event_types!inner(name, reminder_channel_session_id, reminder_meta_template_id, reminder_enabled, reminder_minutes_before, reminder_extra_offsets_minutes, reminder_template_name, reminder_body, reminder_bodies, location_details), organizations:organization_id!inner(status)",
     )
     .eq("status", "confirmed")
     // Org parada sai no banco, ANTES do `limit`: filtrar só em memória a deixaria
@@ -544,6 +644,7 @@ async function handle(req: NextRequest): Promise<Response> {
 
   const linhas = (data ?? []) as unknown as CompromissoAVencer[];
   let enviados = 0;
+  let enviadosPorModelo = 0;
   let pulados = 0;
   const motivos: Record<string, number> = {};
   const pular = (motivo: string) => {
@@ -624,18 +725,65 @@ async function handle(req: NextRequest): Promise<Response> {
       continue;
     }
 
-    const { data: canal } = await admin
-      .from("channel_sessions")
-      .select("id")
-      .eq("organization_id", org)
-      .eq("status", "WORKING")
-      .limit(1)
-      .maybeSingle();
+    // Configuração explícita do tipo → conversa da reserva → único canal elegível.
+    // Um vínculo indisponível não autoriza atravessar para outro número.
+    const escolha = await resolverRemetenteDoLembrete(
+      admin,
+      linha,
+      tipo.reminder_channel_session_id ?? null,
+      agora,
+      contato.phone_number,
+    );
+    // Fora da janela de 24 h, com UM número certo e um modelo aprovado dele no
+    // tipo, o lembrete sai pelo modelo (`lib/agenda/lembrete-por-modelo.ts`).
+    // Sem modelo configurado, nada muda: não envia, não carimba, avisa a equipe.
+    const numeroForaDaJanela = escolha.canal ? undefined : escolha.foraDaJanela;
+    const modelo: ModeloDoLembrete | null =
+      numeroForaDaJanela && tipo.reminder_meta_template_id
+        ? await lerModeloDoLembrete(admin, org, tipo.reminder_meta_template_id, numeroForaDaJanela.id)
+        : null;
 
-    if (!canal) {
-      pular("sem_canal");
+    const organizacao = await organizacaoDe(org);
+    const dadosDoLembrete = {
+      nomeDoContato: nomeDoContato(contato),
+      titulo: linha.title,
+      quando: new Date(linha.starts_at),
+      timezone: organizacao?.timezone ?? "America/Sao_Paulo",
+      local: linha.location_details ?? tipo.location_details ?? null,
+      idioma: normalizarIdioma(organizacao?.locale),
+      tipoNome: tipo.name,
+    };
+
+    // Os valores do modelo ANTES do aviso e do carimbo: um modelo que não fecha
+    // (pede o endereço e a reserva não tem) não consome o degrau, e a equipe
+    // continua avisada — o aviso só se resolve quando algo vai mesmo sair.
+    const porModelo = modelo ? valoresDoModeloDoLembrete(modelo, pecasParaOModelo(dadosDoLembrete)) : null;
+
+    await atualizarAvisoDeRemetente(admin, org, linha.id, escolha.canal || porModelo ? null : escolha.motivo);
+    if (!escolha.canal && !porModelo) {
+      logger.warn("[agenda-reminder] lembrete sem remetente seguro", {
+        appointmentId: linha.id,
+        organizationId: org,
+        motivo: escolha.motivo,
+        ...(modelo ? { modelo: modelo.name } : {}),
+        requestId,
+      });
+      // Modelo configurado que não serve (de outro número, não aprovado,
+      // apagado) ou que não fecha: o motivo diz isso, e não só "fora da janela"
+      // — quem lê o resumo da rodada precisa saber que a configuração existe.
+      if (modelo) {
+        pular("modelo_do_lembrete_sem_valores");
+        continue;
+      }
+      if (tipo.reminder_meta_template_id && escolha.motivo === "canal_fora_da_janela_24h") {
+        pular("modelo_do_lembrete_indisponivel");
+        continue;
+      }
+      pular(escolha.motivo);
       continue;
     }
+    const canal: CanalDoLembrete | undefined = escolha.canal ?? numeroForaDaJanela;
+    if (!canal) continue; // inalcançável: com modelo há `numeroForaDaJanela`
 
     const foraDaJanela = await adiarAteAJanelaAbrir(admin, org, canal.id);
     if (foraDaJanela) {
@@ -643,30 +791,19 @@ async function handle(req: NextRequest): Promise<Response> {
       continue;
     }
 
-    const organizacao = await organizacaoDe(org);
-
     let molde = moldeDoDegrau(tipo, Math.min(...pendentes));
     if (!molde && tipo.reminder_template_name) {
-      const { data: modelo } = await admin
+      const { data: modeloDeTexto } = await admin
         .from("message_templates")
         .select("body")
         .eq("organization_id", org)
         .or(`shortcut.eq.${tipo.reminder_template_name},title.eq.${tipo.reminder_template_name}`)
         .limit(1)
         .maybeSingle();
-      if (modelo?.body) molde = modelo.body;
+      if (modeloDeTexto?.body) molde = modeloDeTexto.body;
     }
 
-    const corpo = montarLembrete({
-      nomeDoContato: nomeDoContato(contato),
-      titulo: linha.title,
-      quando: new Date(linha.starts_at),
-      timezone: organizacao?.timezone ?? "America/Sao_Paulo",
-      local: linha.location_details ?? tipo.location_details ?? null,
-      idioma: normalizarIdioma(organizacao?.locale),
-      molde,
-      tipoNome: tipo.name,
-    });
+    const corpo = montarLembrete({ ...dadosDoLembrete, molde });
 
     // ─── O CARIMBO ANTES DO ENVIO (issue #2223) ────────────────────────────
     //
@@ -722,11 +859,21 @@ async function handle(req: NextRequest): Promise<Response> {
           actor: { type: "webhook_source", id: linha.id },
           requestId: `agenda-reminder:${linha.id}`,
         },
-        { conversation_id: conversaId, type: "text", body: corpo } as Parameters<
+        (modelo && porModelo
+          ? {
+              conversation_id: conversaId,
+              type: "template",
+              template_name: modelo.name,
+              template_language: modelo.language,
+              template_values: porModelo.valores,
+              body: porModelo.texto,
+            }
+          : { conversation_id: conversaId, type: "text", body: corpo }) as Parameters<
           typeof sendMessageHandler
         >[2],
       );
       enviados += 1;
+      if (modelo) enviadosPorModelo += 1;
     } catch (err) {
       // A org parou entre a leitura da rodada e o envio: não é erro, é a
       // suspensão (a porta de saída lança OrgNaoOperanteError). Nesta corrida o
@@ -737,7 +884,11 @@ async function handle(req: NextRequest): Promise<Response> {
         continue;
       }
       const mensagem = err instanceof Error ? err.message : String(err);
-      logger.error("[agenda-reminder] envio falhou", { appointmentId: linha.id, error: mensagem, requestId });
+      logger.error("[agenda-reminder] envio falhou", {
+        appointmentId: linha.id,
+        error: mensagem,
+        requestId,
+      });
       pular("erro_no_envio");
     }
   }
@@ -750,7 +901,7 @@ async function handle(req: NextRequest): Promise<Response> {
       action: "agenda.lembrete_enviado",
       resourceType: "calendar_appointment",
       requestId,
-      metadata: { enviados, pulados, motivos },
+      metadata: { enviados, por_modelo: enviadosPorModelo, pulados, motivos },
     });
   }
 
