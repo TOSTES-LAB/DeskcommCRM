@@ -21,6 +21,10 @@
  * é justamente quando alguém vai querer lê-lo. Gravar só no fim perderia
  * exatamente os casos que motivam o arquivo.
  *
+ * A entrada que responde antes de processar escreve uma terceira vez, no meio:
+ * a marca de aceita (`valid_signature = true`), gravada antes do 200 — é o que o
+ * cron `webhook-replay` procura quando o processamento não termina.
+ *
  * ─── O que este módulo NÃO faz ──────────────────────────────────────────────
  *
  * Não interpreta o payload. `event_type` e `external_id` ficam nulos de
@@ -34,7 +38,11 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { logger } from "@/lib/logger";
 
 /** Cabeçalhos que NUNCA entram no arquivo, por menor que seja a chance. */
-const PROIBIDOS = ["authorization", "cookie", "x-api-key"];
+// `asaas-access-token` (spec da cobrança do revendedor §2.4): o Asaas autentica
+// o webhook com um token ESTÁTICO no cabeçalho — é a credencial inteira, não uma
+// assinatura. A rota de cobrança nem grava cabeçalho; isto é o cinto para quando
+// alguém apontar o aviso do Asaas para uma rota de canal.
+const PROIBIDOS = ["authorization", "cookie", "x-api-key", "asaas-access-token"];
 
 /**
  * Cabeçalhos sanitizados.
@@ -54,8 +62,12 @@ function cabecalhosSeguros(headers: Headers): Record<string, string> {
 
 /**
  * Abre a linha do arquivo. Devolve o id para o fechamento, ou `null` quando não
- * deu — e "não deu" nunca interrompe a ingestão: perder o arquivo é ruim, perder
- * a mensagem do cliente é pior.
+ * deu — e "não deu" não interrompe a ingestão que roda ANTES da resposta: perder
+ * o arquivo é ruim, perder a mensagem do cliente é pior.
+ *
+ * A exceção é o evento que o canal processa DEPOIS de responder
+ * (`./entrada-aceita.ts`): ali a linha é a única coisa que garante a mensagem
+ * se o processo morrer, e sem ela a rota responde 503 para o provedor reentregar.
  */
 export async function abrirArquivoDoWebhook(
   admin: SupabaseClient,

@@ -15,12 +15,41 @@ export interface ModuloCatalogo {
 
 export const CATALOGO_DE_MODULOS: readonly ModuloCatalogo[] = [
   {
+    slug: "cadencias",
+    nome: "Cadências de e-mail",
+    descricao: "Sequências de e-mail por negócio, com envio pela instalação, descadastro e abertura somente com consentimento. Contribuição de Marcelo (@lmarceloc), PR #1738.",
+  },
+  {
     slug: "honorarios",
     nome: "Honorários (advocacia)",
     descricao:
       "Contrato de honorários (fixo, êxito ou misto) e o calendário de parcelas, ligado ao caixa " +
       "do núcleo. Para escritórios de advocacia que cobram por caso.",
   },
+  {
+    // #1907 item 4 — sem esta linha `service.ts:84` recusava o slug fora do
+    // catálogo (`extension_module_unknown`) e não havia como instalar a
+    // comanda em lugar nenhum: as telas e as rotas ficariam mortas para
+    // sempre, mesmo com a provisionadora pronta.
+    slug: "financeiro",
+    // As cinco tabelas da comanda nascem SÓ onde o módulo é instalado (ADR-0002
+    // D2/D3). O texto abaixo é o que quem administra lê em `/admin/modulos`.
+    nome: "Comandas",
+    descricao:
+      "A comanda do atendimento: itens, forma de pagamento, comissões e fidelidade. O caixa " +
+      "continua no sistema mesmo sem este módulo. Toda instalação anterior a esta versão " +
+      "continua com Comandas ligada.",
+  },
+  {
+    slug: "lista_de_espera",
+    nome: "Lista de espera da agenda",
+    descricao:
+      "Quando um horário abre, a vaga é oferecida a uma pessoa por vez, entre quem aceitou ser " +
+      "avisado. Cada empresa escolhe os prazos da oferta antes de ligar.",
+  },
+  // ponytail: "ouvidoria" fica fora até haver tela (#3636). Sem o slug aqui,
+  // `instalarModulo` recusa com `extension_module_unknown` e Módulos não o lista;
+  // `MODULOS_OPCIONAIS`/`MODULOS_DE_TABELA` e as guardas seguem, e ninguém instala.
 ];
 
 export function moduloDoCatalogo(slug: string): ModuloCatalogo | undefined {
