@@ -11,7 +11,11 @@ import { RouterEditorClient } from "./_client";
 export const dynamic = "force-dynamic";
 
 const ROUTER_DETAIL_COLUMNS = "id, name, channel_session_id, is_active, config, fallback_agent_id";
-const MEMBER_COLUMNS = "id, agent_id, intent_name, intent_description, examples, position, flow_pointer_id";
+// #2415 — SEM pipeline_id/stage_id aqui, o initialState do SSR nascia sem
+// destino: o draft montado a partir dele mostrava "Sem destino" a cada recarga,
+// mesmo com os campos gravados no banco (a API de detalhe já trazia os dois).
+const MEMBER_COLUMNS =
+  "id, agent_id, intent_name, intent_description, examples, position, flow_pointer_id, pipeline_id, stage_id";
 
 export default async function RouterEditorPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -50,6 +54,13 @@ export default async function RouterEditorPage({ params }: { params: Promise<{ i
 
   if (!routerRow) notFound();
 
+  // #4340 — o número deste roteador pode ter sido remoto/arquivado: ele some da
+  // lista de canais oferecíveis (`listSelectableChannels` filtra
+  // `archived_at`). A tela já escrevia "Número removido", mas o roteador
+  // seguia "ativo" e o operador não sabia que aquele número não roteia mais
+  // nada — nem que as conversas do número NOVO caem no agente principal.
+  const numeroRemovido = !channelSessions.some((c) => c.id === routerRow.channel_session_id);
+
   // Só os modelos que esta organização consegue usar de fato — ver a razão em
   // lib/ai/classifier-models.
   const classifierModels = await listClassifierModels(supabase, activeOrg.orgId, {
@@ -58,6 +69,10 @@ export default async function RouterEditorPage({ params }: { params: Promise<{ i
   });
 
   const initialState: RouterDetailState = {
+    // O formulário recebe o `is_active` GRAVADO. Entregar `false` aqui por
+    // causa do número removido faria o próximo "Salvar" gravar a desativação
+    // sem o operador ter escolhido. Quem mostra o estado efetivo (não roteia)
+    // é a tela, pela flag `numeroRemovido`.
     router: routerRow as RouterDetailState["router"],
     members: (memberRows ?? []) as RouterDetailState["members"],
   };
@@ -72,6 +87,7 @@ export default async function RouterEditorPage({ params }: { params: Promise<{ i
         agents={agents}
         channelSessions={channelSessions}
         classifierModels={classifierModels}
+        numeroRemovido={numeroRemovido}
       />
     </div>
   );
