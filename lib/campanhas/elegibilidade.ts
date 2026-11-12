@@ -24,14 +24,18 @@
  * registrada que `lib/automation/guarda-do-contato.ts` já respeita no resto do
  * produto. A campanha não cria régua concorrente: lê as que existem.
  */
+import { recusaRegistrada } from "@/lib/lgpd/recusa-registrada";
+
 import type { CamposPersonalizados } from "./renderizador";
-import type { MotivoDeExclusao } from "./tipos";
+import type { MotivoDeExclusao, StatusDoDestinatario } from "./tipos";
 
 /** O que se sabe do destinatário na hora de decidir. Nada além disto importa. */
 export interface ContatoParaDecidir {
   contactId: string;
   telefone: string | null;
   bloqueado: boolean;
+  /** `contacts.is_personal` (spec 21): fora da operação, nada sai para ele. */
+  pessoal: boolean;
   anonimizado: boolean;
   /** `consent.marketing.declined_at` — recusa REGISTRADA, diferente de ausência. */
   recusouMarketing: boolean;
@@ -50,12 +54,23 @@ const E164 = /^\+\d{8,15}$/;
  */
 export function motivoParaExcluir(c: ContatoParaDecidir): MotivoDeExclusao | null {
   if (c.bloqueado) return "opt_out";
+  if (c.pessoal) return "contato_pessoal";
   if (c.anonimizado) return "anonimizado";
   if (c.recusouMarketing) return "recusou_marketing";
   const telefone = c.telefone?.trim() ?? "";
   if (telefone === "") return "sem_telefone";
   if (!E164.test(telefone)) return "telefone_invalido";
   return null;
+}
+
+/**
+ * O status de quem a rodada tira da fila. Pessoal tem saída própria (spec 21,
+ * D7): nunca `opted_out`, que inflaria "pediu para parar" com quem nunca pediu.
+ */
+export function statusDaSaida(motivo: MotivoDeExclusao): StatusDoDestinatario {
+  if (motivo === "opt_out") return "opted_out";
+  if (motivo === "contato_pessoal") return "personal";
+  return "skipped";
 }
 
 /** Um candidato do recorte, já lido do banco. */
@@ -176,10 +191,8 @@ export function contarExclusoes(
 
 /** Lê `contacts.consent` sem confiar no shape — é jsonb livre. */
 export function recusouMarketing(consent: unknown): boolean {
-  if (!consent || typeof consent !== "object") return false;
-  const marketing = (consent as Record<string, unknown>).marketing;
-  if (!marketing || typeof marketing !== "object") return false;
-  return !!(marketing as Record<string, unknown>).declined_at;
+  // Nos dois formatos, `declined_at` da captação e `granted: false` da ficha.
+  return recusaRegistrada(consent, "marketing");
 }
 
 /**
